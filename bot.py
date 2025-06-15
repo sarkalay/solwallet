@@ -1,134 +1,127 @@
-const { Connection, PublicKey, Keypair, Transaction, SystemProgram, sendAndConfirmTransaction } = require('@solana/web3.js');
-const bs58 = require('bs58');
-const dotenv = require('dotenv');
+from solana.rpc.api import Client
+from solana.transaction import Transaction
+from solana.system_program import TransferParams, transfer
+from solders.keypair import Keypair
+from solders.pubkey import Pubkey
+from dotenv import load_dotenv
+import os
+import time
+import base58
 
-// Load environment variables
-dotenv.config();
+# Load environment variables
+load_dotenv()
 
-// Solana configuration
-const config = {
-  rpc_url: process.env.SOLANA_RPC_URL,
-  receiver_address: process.env.SOLANA_RECEIVER_ADDRESS,
-  name: 'Solana Devnet',
-  minimum_lamports: 1_000_000, // Minimum balance to trigger transfer (0.001 SOL)
-};
-
-// Load sender wallets dynamically
-const wallets = {};
-const sender_users = new Set();
-for (const key of Object.keys(process.env)) {
-  if (key.startsWith('SOLANA_SENDER_')) {
-    const user = key.replace('SOLANA_SENDER_', '');
-    sender_users.add(user);
-  }
+# Solana configuration
+config = {
+    'rpc_url': os.getenv('SOLANA_RPC_URL'),
+    'receiver_address': os.getenv('SOLANA_RECEIVER_ADDRESS'),
+    'name': 'Solana Devnet',
+    'minimum_lamports': 1_000_000,  # Minimum balance to trigger transfer (0.001 SOL)
 }
 
-for (const user of sender_users) {
-  const address = process.env[`SOLANA_SENDER_${user}`];
-  const private_key = process.env[`SOLANA_PRIVATE_KEY_${user}`];
-  if (address && private_key) {
-    try {
-      wallets[address] = bs58.decode(private_key); // Decode Base58 private key
-    } catch (e) {
-      console.log(`Warning: Invalid private key for ${user} (${address}), skipping...`);
-    }
-  } else {
-    console.log(`Warning: SOLANA_SENDER_${user} or SOLANA_PRIVATE_KEY_${user} not found in .env, skipping...`);
-  }
-}
+# Load sender wallets dynamically
+wallets = {}
+sender_users = set()
+for key in os.environ.keys():
+    if key.startswith('SOLANA_SENDER_'):
+        user = key.replace('SOLANA_SENDER_', '')
+        sender_users.add(user)
 
-// Check if any valid wallets are configured
-if (Object.keys(wallets).length === 0) {
-  console.log('Error: No valid sender wallets found in .env file');
-  process.exit(1);
-}
+for user in sender_users:
+    address = os.getenv(f'SOLANA_SENDER_{user}')
+    private_key = os.getenv(f'SOLANA_PRIVATE_KEY_{user}')
+    if address and private_key:
+        try:
+            # Decode Base58 private key
+            private_key_bytes = base58.b58decode(private_key)
+            wallets[address] = private_key_bytes
+        except Exception as e:
+            print(f"Warning: Invalid private key for {user} ({address}), skipping: {e}")
+    else:
+        print(f"Warning: SOLANA_SENDER_{user} or SOLANA_PRIVATE_KEY_{user} not found in .env, skipping...")
 
-// Initialize Solana connection
-const connection = new Connection(config.rpc_url, 'confirmed');
-connection.getVersion().then(version => {
-  console.log(`Connected to ${config.name}, version: ${version['solana-core']}`);
-}).catch(e => {
-  console.log(`Failed to connect to ${config.name} node: ${e}`);
-  process.exit(1);
-});
+# Check if any valid wallets are configured
+if not wallets:
+    print("Error: No valid sender wallets found in .env file")
+    exit(1)
 
-// Convert receiver address to PublicKey
-let receiverPubkey;
-try {
-  receiverPubkey = new PublicKey(config.receiver_address);
-} catch (e) {
-  console.log(`Invalid receiver address: ${e}`);
-  process.exit(1);
-}
+# Initialize Solana connection
+client = Client(config['rpc_url'])
+try:
+    version = client.get_version()
+    print(f"Connected to {config['name']}, version: {version.value['solana-core']}")
+except Exception as e:
+    print(f"Failed to connect to {config['name']} node: {e}")
+    exit(1)
 
-// Track last known balances
-const last_balances = {};
-for (const address of Object.keys(wallets)) {
-  last_balances[address] = 0; // Initialize balances
-}
+# Convert receiver address to Pubkey
+try:
+    receiver_pubkey = Pubkey.from_string(config['receiver_address'])
+except ValueError as e:
+    print(f"Invalid receiver address: {e}")
+    exit(1)
 
-// Transfer function for Solana
-async function transfer_funds(sender_address, private_key, receiver_address) {
-  try {
-    const senderKeypair = Keypair.fromSecretKey(private_key);
-    const current_balance = await connection.getBalance(new PublicKey(sender_address));
+# Track last known balances
+last_balances = {addr: 0 for addr in wallets}
 
-    // Calculate amount to transfer (leave some lamports for fees)
-    const lamports_to_transfer = current_balance - 5000; // 5000 lamports for transaction fee
-    if (lamports_to_transfer <= 0) {
-      console.log(`Insufficient balance for ${sender_address} to cover fees`);
-      return false;
-    }
+# Transfer function for Solana
+def transfer_funds(client, private_key, sender_address, receiver_pubkey):
+    try:
+        sender_keypair = Keypair.from_bytes(private_key)
+        sender_pubkey = Pubkey.from_string(sender_address)
+        current_balance = client.get_balance(sender_pubkey).value
 
-    const transaction = new Transaction().add(
-      SystemProgram.transfer({
-        fromPubkey: senderKeypair.publicKey,
-        toPubkey: receiver_address,
-        lamports: lamports_to_transfer,
-      })
-    );
+        # Calculate amount to transfer (leave 5000 lamports for fees)
+        lamports_to_transfer = current_balance - 5000
+        if lamports_to_transfer <= 0:
+            print(f"Insufficient balance for {sender_address} to cover fees")
+            return False
 
-    const signature = await sendAndConfirmTransaction(connection, transaction, [senderKeypair]);
-    console.log(`Transfer sent from ${sender_address}: ${signature}`);
-    return true;
-  } catch (e) {
-    console.log(`Error transferring from ${sender_address}: ${e}`);
-    return false;
-  }
-}
+        # Create transaction
+        tx = Transaction().add(
+            transfer(
+                TransferParams(
+                    from_pubkey=sender_keypair.pubkey(),
+                    to_pubkey=receiver_pubkey,
+                    lamports=lamports_to_transfer
+                )
+            )
+        )
 
-// Check and transfer funds
-async function check_and_transfer() {
-  for (const [sender_address, private_key] of Object.entries(wallets)) {
-    try {
-      const current_balance = await connection.getBalance(new PublicKey(sender_address));
-      if (current_balance > last_balances[sender_address] && current_balance >= config.minimum_lamports) {
-        console.log(`New deposit detected for ${sender_address}! Current balance: ${current_balance / 1_000_000_000} SOL`);
-        const success = await transfer_funds(sender_address, private_key, receiverPubkey);
-        if (success) {
-          last_balances[sender_address] = current_balance;
-        }
-      } else {
-        console.log(`No new deposits for ${sender_address}`);
-      }
-      last_balances[sender_address] = current_balance;
-    } catch (e) {
-      console.log(`Error checking ${sender_address}: ${e}`);
-    }
-  }
-}
+        # Send and confirm transaction
+        signature = client.send_transaction(tx, sender_keypair).value
+        print(f"Transfer sent from {sender_address}: {signature}")
+        client.confirm_transaction(signature)
+        print(f"Transfer confirmed from {sender_address}: {signature}")
+        return True
+    except Exception as e:
+        print(f"Error transferring from {sender_address}: {e}")
+        return False
 
-// Main loop
-async function main() {
-  console.log(`Starting wallet monitoring for ${config.name}...`);
-  console.log(`Monitoring ${Object.keys(wallets).length} wallets`);
-  while (true) {
-    await check_and_transfer();
-    await new Promise(resolve => setTimeout(resolve, 7000)); // Check every 7 seconds
-  }
-}
+# Check and transfer funds
+def check_and_transfer():
+    for sender_address, private_key in wallets.items():
+        try:
+            sender_pubkey = Pubkey.from_string(sender_address)
+            current_balance = client.get_balance(sender_pubkey).value
+            if current_balance > last_balances[sender_address] and current_balance >= config['minimum_lamports']:
+                print(f"New deposit detected for {sender_address}! Current balance: {current_balance / 1_000_000_000} SOL")
+                success = transfer_funds(client, private_key, sender_address, receiver_pubkey)
+                if success:
+                    last_balances[sender_address] = current_balance
+            else:
+                print(f"No new deposits for {sender_address}")
+            last_balances[sender_address] = current_balance
+        except Exception as e:
+            print(f"Error checking {sender_address}: {e}")
 
-main().catch(e => {
-  console.error(`Main loop error: ${e}`);
-  process.exit(1);
-});
+# Main loop
+def main():
+    print(f"Starting wallet monitoring for {config['name']}...")
+    print(f"Monitoring {len(wallets)} wallets")
+    while True:
+        check_and_transfer()
+        time.sleep(7)  # Check every 7 seconds
+
+if __name__ == "__main__":
+    main()
